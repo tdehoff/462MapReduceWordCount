@@ -1,4 +1,3 @@
-#include <cstdio>
 #include <fstream>
 #include <unordered_map>
 #include <string>
@@ -6,11 +5,11 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <omp.h>
 
 using namespace std;
 
 void process_word(string &w) {
-    // cout << "DEBUG: " << w << " ---> ";           // DEBUG PRINT
     // Remove punctuation at beginning
     while (!w.empty() && ispunct(w[0])) {
         w.erase(0, 1);
@@ -25,7 +24,6 @@ void process_word(string &w) {
             w[i] = tolower(w[i]);
         }
     }
-    // cout << w << endl;                              // DEBUG PRINT
 }
 
 int main(int argc, char* argv[]) {
@@ -34,6 +32,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    double start, end;
+    start = omp_get_wtime();
+
+    // File reading step
     ifstream fin(argv[1]);
     if (!fin) {
         fprintf(stderr, "error: unable to open input file: %s\n", argv[1]);
@@ -42,11 +44,15 @@ int main(int argc, char* argv[]) {
 
     string word;
     vector<pair<string, size_t>> raw_tuples;
+    size_t file_word_count = 0;
 
     while (fin >> word) {
+        file_word_count++;
         process_word(word);
         // Map step
-        raw_tuples.push_back(pair(word, 1));
+        if (!word.empty()) {          // avoid pushing empty strings
+            raw_tuples.push_back(pair(word, 1));
+        }
     }
 
     // Shuffle step
@@ -65,16 +71,20 @@ int main(int argc, char* argv[]) {
         counts.push_back(pair(entry.first, sum));
     }
 
-    // Sort for print consistency: larger counts first
-    // May remove after we verify correctness
+    // Sort in alphabetical order
     sort(counts.begin(), counts.end(), [](const pair<string, int> &a, const pair<string, int> &b) {
-        return a.second > b.second;
+        return a.first < b.first;
     });
 
     // Print step
+    cout << "Filename: " << argv[1] << ", total words: " << file_word_count << endl;
     for (size_t i = 0; i < counts.size(); ++i) {
         cout << "[" << i << "] " << counts[i].first << ": " << counts[i].second << endl;
     }
+
+    end = omp_get_wtime();
+    // Use cerr to always print in terminal
+    cerr << "Sequential time: " << (end - start) * 1000 << " ms\n";
 
     return 0;
 }
