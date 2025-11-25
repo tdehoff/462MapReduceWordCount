@@ -198,78 +198,77 @@ int main(int argc, char* argv[]) {
     double start, end, start_r, start_p;
     start = MPI_Wtime();
 
-    // File reading step
-    if (rank == 0) {
-        size_t f_count = 1;
-        size_t active_ranks = size - 1;
-        MPI_Status stat;
-        int tmp;
-        int flag;
+    #pragma omp parallel
+    {
+        #pragma omp master
+        {
+            // File reading step
+            if (rank == 0) {
+                size_t f_count = 1;
+                size_t active_ranks = size - 1;
+                MPI_Status stat;
+                int tmp;
+                int flag;
 
-        while (active_ranks > 0) {
-            MPI_Iprobe(MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &flag, &stat);
-            if (!flag && readers_avail > 0) {
-                #pragma omp parallel
-                {
-                    #pragma omp single
-                    {
+                while (active_ranks > 0) {
+                    // Check if any ranks sent a pending request
+                    MPI_Iprobe(MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &flag, &stat);
+                    // If not, generate tasks for master rank theads
+                    if (!flag && readers_avail > 0) {
                         if (f_count < argc) {
                             #pragma omp task
                             {
-                                cerr << "rank " << rank << " starts reading a file\n";
+                                cerr << "rank " << rank << " starts reading a file " << argv[f_count] << "\n";
                                 read_file(argv[f_count]);
+                                cerr << "rank " << rank << " read " << total_words << "words\n";
                             }
                             f_count++;
                         }
                     }
+                    else {
+                        // Use tag = 1 for requests
+                        MPI_Recv(&tmp, 1, MPI_INT, MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &stat);
+                        int requesting_rank = stat.MPI_SOURCE;
+
+                        int send_buff = -1;
+                        if (f_count < argc) {
+                            send_buff = f_count;
+                            f_count++;
+                        }
+                        else {
+                            // This rank receives -1 for "work done"
+                            active_ranks--;
+                        }
+                        // Use tag = 2 for responds
+                        MPI_Send(&send_buff, 1, MPI_INT, requesting_rank, 2, MPI_COMM_WORLD);
+                    }
                 }
             }
             else {
-                // Use tag = 1 for requests
-                MPI_Recv(&tmp, 1, MPI_INT, MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &stat);
-                int requesting_rank = stat.MPI_SOURCE;
+                int rec_buff = 0;
+                while (true) {
+                    if (readers_avail > 0) {
+                        // Send request
+                        MPI_Send(&rec_buff, 1, MPI_INT, 0, 1, MPI_COMM_WORLD);
+                        // Receive file number or -1 for "work done"
+                        MPI_Recv(&rec_buff, 1, MPI_INT, 0, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-                int send_buff = -1;
-                if (f_count < argc) {
-                    send_buff = f_count;
-                    f_count++;
-                }
-                else {
-                    // This rank receives -1 for "work done"
-                    active_ranks--;
-                }
+                        if (rec_buff == -1) {
+                            break;
+                        }
 
-                // Use tag = 2 for responds
-                MPI_Send(&send_buff, 1, MPI_INT, requesting_rank, 2, MPI_COMM_WORLD);
-            }
-        }
-    }
-    else {
-        int rec_buff = 0;
-        while (true) {
-            if (readers_avail > 0) {
-                // Send request
-                MPI_Send(&rec_buff, 1, MPI_INT, 0, 1, MPI_COMM_WORLD);
-                // Receive file number or -1 for "work done"
-                MPI_Recv(&rec_buff, 1, MPI_INT, 0, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-                if (rec_buff == -1) {
-                    break;
-                }
-                #pragma omp parallel
-                {
-                    #pragma omp single
-                    {
                         #pragma omp task
                         {
-                            cerr << "rank " << rank << " starts reading a file\n";
+                            cerr << "rank " << rank << " starts reading a file " << argv[rec_buff] << "\n";
                             read_file(argv[rec_buff]);
+                            cerr << "rank " << rank << " read " << total_words << "words\n";
                         }
                     }
                 }
             }
         }
     }
+
 
     // #pragma omp parallel
     // {
