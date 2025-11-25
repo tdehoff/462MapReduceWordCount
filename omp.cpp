@@ -10,7 +10,7 @@
 
 using namespace std;
 
-queue<string> readers_q;
+vector<string> readers_q;
 vector<queue<pair<string, size_t>>> reducer_queues;
 unordered_map<string, size_t> global_counts;
 
@@ -47,16 +47,23 @@ void read_file (char* fname) {
         exit(1);
     }
 
+    // Process words in chunks to reduce locking
+    const int chunk_size = 1024;  // select the best chunk size
+    vector<string> words;
+    words.reserve(chunk_size);
+
     string word;
     while (fin >> word) {
         process_word(word);
         if (!word.empty()) {          // avoid pushing empty strings
             wc++;
-            omp_set_lock(&readers_lock);
-            readers_q.push(word);
-            omp_unset_lock(&readers_lock);
+            words.push_back(word);
         }
     }
+    omp_set_lock(&readers_lock);
+    readers_q.insert(readers_q.end(), make_move_iterator(words.begin()), make_move_iterator(words.end()));
+    omp_unset_lock(&readers_lock);
+
     #pragma omp atomic
     total_words += wc;
 
@@ -75,46 +82,13 @@ int hash_str(string s, int R) {
 void mapping_step() {
     unordered_map<string, size_t> buckets;
 
-    // Grab elemnts from the work q in chunks
-    const int chunk_size = 1024;  // find which chunk size works the best
-    vector<string> working_batch(chunk_size);
-
-    while (true) {
-        working_batch.clear();
-
-        // Lock and grab new chunk of elements if queue is not empty
-        omp_set_lock(&readers_lock);
-        for (size_t i = 0; i < chunk_size && !readers_q.empty(); ++i) {
-            working_batch.push_back(readers_q.front());
-            readers_q.pop();
-        }
-        omp_unset_lock(&readers_lock);
-
-        if (!working_batch.empty()) {
-            // Queue not empty -- process new elements
-            for (size_t i = 0; i < working_batch.size(); ++i) {
-                buckets[working_batch[i]]++;
-            }
-        }
-        else {
-            int remaining;
-            // Shared global variable -- must be read atomically
-            #pragma omp atomic read
-            remaining = files_remain;
-
-            if (remaining == 0) {
-                // Queue empty and all files are processed
-                break;
-            }
-            else {
-                // Mappers are ahead of readers
-                #pragma omp taskyield
-            }
-        }
+    #pragma omp for schedule(dynamic)
+    for (size_t i = 0; i < readers_q.size(); ++i) {
+        buckets[readers_q[i]]++;
     }
 
     // Push thread's results into the reducer queues
-    for (auto el : buckets) {
+    for (auto &el : buckets) {
         int index = hash_str(el.first, num_reducers);
         omp_set_lock(&reducer_locks[index]);
         reducer_queues[index].push(el);
@@ -176,32 +150,23 @@ int main(int argc, char* argv[]) {
                 }
                 f_count++;
             }
-            end_f = omp_get_wtime();
-
-            start_m = omp_get_wtime();
-            // Mapping step
-            for (int i = 0; i < num_mappers; ++i) {
-                #pragma omp task
-                {
-                    mapping_step();
-                }
-            }
-
-            // Wait for readers + reducers to complete
-            #pragma omp taskwait
-            end_m = omp_get_wtime();
-
-            start_r = omp_get_wtime();
-            // Reducing step
-            for (int i = 0; i < num_reducers; ++i) {
-                #pragma omp task firstprivate(i)
-                {
-                    reduce_step(i);
-                }
-            }
-            end_r = omp_get_wtime();
         }
+        #pragma omp taskwait
+        end_f = omp_get_wtime();
+
+        start_m = omp_get_wtime();
+        // Mapping step
+        mapping_step();
     }
+    end_m = omp_get_wtime();
+
+    start_r = omp_get_wtime();
+    // Reducing step
+    #pragma omp parallel for
+    for (int i = 0; i < num_reducers; ++i) {
+        reduce_step(i);
+    }
+    end_r = omp_get_wtime();
 
     start_p = omp_get_wtime();
     vector<pair<string, size_t>> counts;
