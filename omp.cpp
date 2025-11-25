@@ -213,5 +213,11 @@ int main(int argc, char* argv[]) {
     // Use cerr to always print in terminal
     cerr << "OpenMP time: " << (end - start) * 1000 << " ms\n";
 
+    omp_destroy_lock(&readers_lock);
+    omp_destroy_lock(&global_counts_lock);
+    for (size_t i = 0; i < num_reducers; ++i) {
+        omp_destroy_lock(&reducer_locks[i]);
+    }
+
     return 0;
 }
