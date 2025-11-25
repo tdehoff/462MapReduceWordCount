@@ -47,10 +47,10 @@ int main(int argc, char* argv[]) {
     size_t file_word_count = 0;
 
     while (fin >> word) {
-        file_word_count++;
         process_word(word);
         // Map step
         if (!word.empty()) {          // avoid pushing empty strings
+            file_word_count++;
             raw_tuples.push_back(pair(word, 1));
         }
     }
