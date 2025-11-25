@@ -18,6 +18,8 @@ unordered_map<string, size_t> global_counts;
 size_t total_words;
 size_t files_remain;
 int num_reducers;
+int num_readers;
+int readers_avail;
 
 omp_lock_t readers_lock;
 vector<omp_lock_t> reducer_locks;
@@ -41,6 +43,9 @@ void process_word(string &w) {
 }
 
 void read_file (char* fname) {
+    #pragma omp atomic
+    readers_avail--;
+
     size_t wc = 0;
     ifstream fin(fname);
     if (!fin) {
@@ -70,6 +75,9 @@ void read_file (char* fname) {
 
     #pragma omp atomic
     files_remain--;
+
+    #pragma omp atomic
+    readers_avail++;
 }
 
 int hash_str(string s, int R) {
@@ -170,7 +178,10 @@ int main(int argc, char* argv[]) {
     int n_threads = omp_get_max_threads();
     int num_mappers = n_threads;
     num_reducers = n_threads * 2;  // Works best on my laptop -- test on ISAAC
-    files_remain = argc - 1;\
+    files_remain = argc - 1;
+
+    num_readers = n_threads / 2;
+    readers_avail = num_readers;
 
     if (rank == 0) {
         cerr << "Testing " <<  n_threads << " thread(s), " << size << " processes\n";
@@ -187,97 +198,140 @@ int main(int argc, char* argv[]) {
     double start, end, start_r, start_p;
     start = MPI_Wtime();
 
-    int done = 0;
     // File reading step
     if (rank == 0) {
         size_t f_count = 1;
+        size_t active_ranks = size - 1;
         MPI_Status stat;
         int tmp;
+        int flag;
 
-        while (f_count < argc) {
-            // Use tag = 1 for requests
-            MPI_Recv(&tmp, 1, MPI_INT, MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &stat);
-            int requesting_rank = stat.MPI_SOURCE;
-            // Use tag = 2 for responds
-            MPI_Send(&f_count, 1, MPI_INT, requesting_rank, 2, MPI_COMM_WORLD);
-            f_count++;
+        while (active_ranks > 0) {
+            MPI_Iprobe(MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &flag, &stat);
+            if (!flag && readers_avail > 0) {
+                #pragma omp parallel
+                {
+                    #pragma omp single
+                    {
+                        if (f_count < argc) {
+                            #pragma omp task
+                            {
+                                cerr << "rank " << rank << " starts reading a file\n";
+                                read_file(argv[f_count]);
+                            }
+                            f_count++;
+                        }
+                    }
+                }
+            }
+            else {
+                // Use tag = 1 for requests
+                MPI_Recv(&tmp, 1, MPI_INT, MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &stat);
+                int requesting_rank = stat.MPI_SOURCE;
+
+                int send_buff = -1;
+                if (f_count < argc) {
+                    send_buff = f_count;
+                    f_count++;
+                }
+                else {
+                    // This rank receives -1 for "work done"
+                    active_ranks--;
+                }
+
+                // Use tag = 2 for responds
+                MPI_Send(&send_buff, 1, MPI_INT, requesting_rank, 2, MPI_COMM_WORLD);
+            }
         }
-        // All files have been distributed here, broadcast "work done"
-        done = 1;
-        MPI_Bcast(&done, 1, MPI_INT, 0, MPI_COMM_WORLD);
     }
     else {
         int rec_buff = 0;
-        while (!done) {
-            // Send non-blocking request
-            MPI_Send(&rec_buff, 1, MPI_INT, 0, 1, MPI_COMM_WORLD);
-            MPI_Recv(&rec_buff, 1, MPI_INT, 0, 2, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
+        while (true) {
+            if (readers_avail > 0) {
+                // Send request
+                MPI_Send(&rec_buff, 1, MPI_INT, 0, 1, MPI_COMM_WORLD);
+                // Receive file number or -1 for "work done"
+                MPI_Recv(&rec_buff, 1, MPI_INT, 0, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-            read_file(argv[rec_buff]);
-        }
-    }
-
-    #pragma omp parallel
-    {
-        #pragma omp single
-        {
-
-
-            while (argv[f_count]) {
-                #pragma omp task firstprivate(f_count)
-                {
-                    read_file(argv[f_count]);
+                if (rec_buff == -1) {
+                    break;
                 }
-                f_count++;
-            }
-
-            // Mapping step
-            for (int i = 0; i < num_mappers; ++i) {
-                #pragma omp task
+                #pragma omp parallel
                 {
-                    mapping_step();
+                    #pragma omp single
+                    {
+                        #pragma omp task
+                        {
+                            cerr << "rank " << rank << " starts reading a file\n";
+                            read_file(argv[rec_buff]);
+                        }
+                    }
                 }
             }
         }
     }
 
-    start_r = omp_get_wtime();
-    // Reducing step
-    #pragma omp parallel for
-    for (int i = 0; i < num_reducers; ++i) {
-        reduce_step(i);
-    }
+    // #pragma omp parallel
+    // {
+    //     #pragma omp single
+    //     {
 
-    start_p = omp_get_wtime();
-    vector<pair<string, size_t>> counts;
-    for (auto &el : global_counts) {
-        counts.emplace_back(el.first, el.second);
-    }
 
-    // Sort in alphabetical order
-    sort(counts.begin(), counts.end(),
-         [](const auto &a, const auto &b) {
-        return a.first < b.first;
-    });
+    //         while (argv[f_count]) {
+    //             #pragma omp task firstprivate(f_count)
+    //             {
+    //                 read_file(argv[f_count]);
+    //             }
+    //             f_count++;
+    //         }
 
-    // Print step
-    cout << "Filename: " << argv[1] << ", total words: " << total_words << endl;
-    for (size_t i = 0; i < counts.size(); ++i) {
-        cout << "[" << i << "] " << counts[i].first << ": " << counts[i].second << endl;
-    }
+    //         // Mapping step
+    //         for (int i = 0; i < num_mappers; ++i) {
+    //             #pragma omp task
+    //             {
+    //                 mapping_step();
+    //             }
+    //         }
+    //     }
+    // }
 
-    end = omp_get_wtime();
-    // Use cerr to always print in terminal
-    cerr << "OpenMP time: " << (end - start) * 1000 << " ms\n";
-    cerr << "  File read & Map time: " << (start_r - start) * 1000 << " ms\n";
-    cerr << "  Reducing time: " << (start_p - start_r) * 1000 << " ms\n";
-    cerr << "  Sort & Print time: " << (end - start_p) * 1000 << " ms\n";
+    // start_r = omp_get_wtime();
+    // // Reducing step
+    // #pragma omp parallel for
+    // for (int i = 0; i < num_reducers; ++i) {
+    //     reduce_step(i);
+    // }
 
-    omp_destroy_lock(&readers_lock);
-    omp_destroy_lock(&global_counts_lock);
-    for (int i = 0; i < num_reducers; ++i) {
-        omp_destroy_lock(&reducer_locks[i]);
-    }
+    // start_p = omp_get_wtime();
+    // vector<pair<string, size_t>> counts;
+    // for (auto &el : global_counts) {
+    //     counts.emplace_back(el.first, el.second);
+    // }
+
+    // // Sort in alphabetical order
+    // sort(counts.begin(), counts.end(),
+    //      [](const auto &a, const auto &b) {
+    //     return a.first < b.first;
+    // });
+
+    // // Print step
+    // cout << "Filename: " << argv[1] << ", total words: " << total_words << endl;
+    // for (size_t i = 0; i < counts.size(); ++i) {
+    //     cout << "[" << i << "] " << counts[i].first << ": " << counts[i].second << endl;
+    // }
+
+    // end = omp_get_wtime();
+    // // Use cerr to always print in terminal
+    // cerr << "OpenMP time: " << (end - start) * 1000 << " ms\n";
+    // cerr << "  File read & Map time: " << (start_r - start) * 1000 << " ms\n";
+    // cerr << "  Reducing time: " << (start_p - start_r) * 1000 << " ms\n";
+    // cerr << "  Sort & Print time: " << (end - start_p) * 1000 << " ms\n";
+
+    // omp_destroy_lock(&readers_lock);
+    // omp_destroy_lock(&global_counts_lock);
+    // for (int i = 0; i < num_reducers; ++i) {
+    //     omp_destroy_lock(&reducer_locks[i]);
+    // }
 
     MPI_Finalize();
     return 0;
