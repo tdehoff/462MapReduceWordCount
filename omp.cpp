@@ -23,13 +23,23 @@ vector<omp_lock_t> reducer_locks;
 omp_lock_t global_counts_lock;
 
 void process_word(string &w) {
-    // Remove punctuation at beginning
-    while (!w.empty() && ispunct(w[0])) {
-        w.erase(0, 1);
+    // Remove punctuation and non-ascii chars at beginning
+    while (!w.empty()) {
+        signed char c = w.front();
+        if (c < 0 || ispunct(c)) {
+            w.erase(0, 1);
+            continue;
+        }
+        break;
     }
-    // Remove punctuation at end
-    while (!w.empty() && ispunct(w[w.size() - 1])) {
-        w.pop_back();
+    // Remove punctuation and non-ascii chars at end
+    while (!w.empty()) {
+        signed char c = w.back();
+        if (c < 0 || ispunct(c)) {
+            w.pop_back();
+            continue;
+        }
+        break;
     }
     // Convert all letters to lowercase
     for (size_t i = 0; i < w.length(); ++i) {
