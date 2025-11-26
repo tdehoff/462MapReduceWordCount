@@ -12,9 +12,9 @@
 using namespace std;
 
 vector<string> readers_q;
-vector<vector<pair<string, size_t>>> send_buffers;
-vector<vector<pair<string, size_t>>> reducer_queues;
-unordered_map<string, size_t> global_counts;
+vector<vector<pair<string, int>>> send_buffers;
+vector<vector<pair<string, int>>> reducer_queues;
+unordered_map<string, int> global_counts;
 
 size_t total_words;
 size_t files_remain;
@@ -22,6 +22,7 @@ int num_reducers;
 int num_readers;
 int readers_avail;
 int total_ranks;
+int num_mappers;
 
 omp_lock_t readers_lock;
 vector<omp_lock_t> mappers_locks;
@@ -103,7 +104,7 @@ int hash_str(string s, int R) {
 }
 
 void mapping_step() {
-    unordered_map<string, size_t> buckets;
+    unordered_map<string, int> buckets;
 
     // Grab elemnts from the work q in chunks
     const int chunk_size = 1024;  // find which chunk size works the best
@@ -152,31 +153,66 @@ void mapping_step() {
     }
 }
 
-void send_data(int my_rank) {
+void exchange_data(int my_rank) {
     for (int i = 0; i < total_ranks; ++i) {
         // Skip sending to yourself, send to reducer queues
         if (i == my_rank) {
             for (auto &el : send_buffers[i]) {
                 int ind = hash_str(el.first, num_reducers);
-                omp_set_lock(&reducer_locks[ind]);
                 reducer_queues[ind].push_back(el);
-                omp_unset_lock(&reducer_locks[ind]);
             }
         }
         else {
             // Send total number of elements first
-            int N = send_buffers[i].size();
-            MPI_Send(&N, 1, MPI_INT, i, 0, MPI_COMM_WORLD);
-            // Send each element individually
-            for (int j = 0; j < N; ++j) {
-                string &w = send_buffers[i][j].first;
-                int64_t count = (int64_t)send_buffers[i][j].second;
-                int w_len = w.length();
-                // Send word length separately
-                MPI_Send(&w_len, 1, MPI_INT, i, 0, MPI_COMM_WORLD);
-                // Send word and frequency count
-                MPI_Send(w.data(), w_len, MPI_CHAR, i, 0, MPI_COMM_WORLD);
-                MPI_Send(&count, 1, MPI_INT64_T, i, 0, MPI_COMM_WORLD);
+            int send_N = send_buffers[i].size();
+            int rec_N;
+
+            MPI_Sendrecv(&send_N, 1, MPI_INT, i, 0,
+                         &rec_N, 1, MPI_INT, i, 0,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            for (int j = 0; j < max(send_N, rec_N); ++j) {
+                int send_len = 0;
+                int send_count = 0;
+                string *send_word = nullptr;
+
+                if (j < send_N) {
+                    send_word = &send_buffers[i][j].first;
+                    send_len = send_word->length();
+                    send_count = send_buffers[i][j].second;
+                }
+
+                int recv_len = 0;
+                int recv_count = 0;
+                string recv_word;
+
+                // Exchange lengths
+                MPI_Sendrecv(
+                    &send_len, 1, MPI_INT, i, 0,
+                    &recv_len, 1, MPI_INT, i, 0,
+                    MPI_COMM_WORLD, MPI_STATUS_IGNORE
+                );
+                recv_word.resize(recv_len);
+
+                // Exchange words
+                MPI_Sendrecv(
+                    send_len ? send_word->data() : nullptr, send_len, MPI_CHAR, i, 0,
+                    recv_len ? &recv_word[0] : nullptr, recv_len, MPI_CHAR, i, 0,
+                    MPI_COMM_WORLD, MPI_STATUS_IGNORE
+                );
+
+                // Exchange counts
+                MPI_Sendrecv(
+                    &send_count, 1, MPI_INT, i, 0,
+                    &recv_count, 1, MPI_INT, i, 0,
+                    MPI_COMM_WORLD, MPI_STATUS_IGNORE
+                );
+
+                // Store received element
+                if (recv_len > 0) {
+                    int idx = hash_str(recv_word, num_reducers);
+                    reducer_queues[idx].push_back({recv_word, recv_count});
+                }
             }
         }
     }
@@ -190,34 +226,31 @@ void receive_data(int my_rank) {
 
         // Receive total buffer size
         int N;
-        MPI_Recv(&N, 1, MPI_INT, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(&N, 1, MPI_INT, i, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
         for (int j = 0; j < N; ++j) {
             // Receive words
             int w_len;
             string w;
-            MPI_Recv(&w_len, 1, MPI_INT, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            MPI_Recv(&w[0], 1, MPI_INT, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(&w_len, 1, MPI_INT, i, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            w.resize(w_len);
+            MPI_Recv(&w[0], w_len, MPI_CHAR, i, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             // Receive counts
-            int64_t count;
-            MPI_Recv(&count, 1, MPI_INT64_T, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            int count;
+            MPI_Recv(&count, 1, MPI_INT, i, 4, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             // Push to reducer queue
             int ind = hash_str(w, num_reducers);
-            omp_set_lock(&reducer_locks[ind]);
-            reducer_queues[ind].push_back({w, (size_t)count});
-            omp_unset_lock(&reducer_locks[ind]);
+            reducer_queues[ind].push_back({w, count});
         }
     }
 }
 
 void reduce_step(int id) {
     // Use local hash table for partial results
-    unordered_map<string, size_t> local_result;
-    while (!reducer_queues[id].empty()) {
-        pair<string, size_t> cur_entry = reducer_queues[id].front();
-        reducer_queues[id].pop_back();
+    unordered_map<string, int> local_result;
+    for (auto &cur_entry : reducer_queues[id]) {
         local_result[cur_entry.first] += cur_entry.second;
     }
     // Merge partial results into global results
@@ -226,6 +259,40 @@ void reduce_step(int id) {
         global_counts[el.first] += el.second;
     }
     omp_unset_lock(&global_counts_lock);
+}
+
+void gather_results(int my_rank) {
+    if (my_rank == 0) {
+        for (int  i = 1; i < total_ranks; ++i) {
+            int N;
+            MPI_Recv(&N, 1, MPI_INT, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            for (int j = 0; j < N; ++j) {
+                int len;
+                MPI_Recv(&len, 1, MPI_INT, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                string w;
+                w.resize(len);
+                MPI_Recv(&w[0], len, MPI_CHAR, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                int count;
+                MPI_Recv(&count, 1, MPI_INT, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                global_counts[w] += count;
+            }
+        }
+    }
+    else {
+        int N = global_counts.size();
+        MPI_Send(&N, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
+
+        for (auto &el : global_counts) {
+            string w = el.first;
+            int len = w.length();
+            int count = el.second;
+
+            MPI_Send(&len, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
+            MPI_Send(w.data(), len, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+            MPI_Send(&count, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
+        }
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -248,9 +315,10 @@ int main(int argc, char* argv[]) {
 
     int n_threads = omp_get_max_threads();
     num_reducers = n_threads * 2;  // Works best on my laptop -- test on ISAAC
-    files_remain = argc - 1;
+    files_remain = 0;
 
     num_readers = n_threads;
+    num_mappers = n_threads;
     readers_avail = num_readers;
     total_ranks = size;
 
@@ -264,8 +332,8 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < num_reducers; ++i) {
         omp_init_lock(&reducer_locks[i]);
     }
-    mappers_locks.resize(num_readers);
-    for (int i = 0; i < num_readers; ++i) {
+    mappers_locks.resize(total_ranks);
+    for (int i = 0; i < total_ranks; ++i) {
         omp_init_lock(&mappers_locks[i]);
     }
     reducer_queues.resize(num_reducers);
@@ -282,33 +350,36 @@ int main(int argc, char* argv[]) {
             if (rank == 0) {
                 int f_count = 1;
                 size_t active_ranks = size - 1;
+                bool done = false;
                 MPI_Status stat;
                 int tmp;
                 int flag;
                 int local_avail;
 
-                while (active_ranks > 0) {
+                while (active_ranks > 0 || !done) {
                     // Check if any ranks sent a pending request
                     MPI_Iprobe(MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &flag, &stat);
 
                     // If not, generate tasks for master rank theads
                     #pragma omp atomic read
                     local_avail = readers_avail;
-                    if (!flag && local_avail > 0) {
+
+                    if (!done && !flag && local_avail > 0) {
                         if (f_count < argc) {
+                            #pragma omp atomic
+                            files_remain++;
+
                             #pragma omp task
                             {
                                 read_file(argv[f_count]);
                             }
                             f_count++;
-
-                            #pragma omp task
-                            {
-                                mapping_step();
-                            }
+                        }
+                        else {
+                            done = true;
                         }
                     }
-                    else {
+                    else if (size > 1) {
                         // Use tag = 1 for requests
                         MPI_Recv(&tmp, 1, MPI_INT, MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &stat);
                         int requesting_rank = stat.MPI_SOURCE;
@@ -343,34 +414,29 @@ int main(int argc, char* argv[]) {
                             break;
                         }
 
+                        #pragma omp atomic
+                        files_remain++;
+
                         #pragma omp task
                         {
                             read_file(argv[rec_buff]);
                         }
-
-                        #pragma omp task
-                        {
-                            mapping_step();
-                        }
                     }
+                }
+            }
+
+            // Mapping step
+            for (int i = 0; i < num_mappers; ++i) {
+                #pragma omp task
+                {
+                    mapping_step();
                 }
             }
         }
     }
     start_c = MPI_Wtime();
-    if (rank == 0) {
-        cerr << "File reading + mapping took " << (start_c - start) * 1000 << " ms\n";
-    }
 
-    // Even ranks send first to avoid deadlock
-    if (rank % 2 == 0) {
-        send_data(rank);
-        receive_data(rank);
-    }
-    else {
-        receive_data(rank);
-        send_data(rank);
-    }
+    exchange_data(rank);
 
     start_r = MPI_Wtime();
     // Reducing step
@@ -379,8 +445,13 @@ int main(int argc, char* argv[]) {
         reduce_step(i);
     }
 
+    // Nothing to gather for single rank
+    if (total_ranks > 1) {
+        gather_results(rank);
+    }
+
     start_p = MPI_Wtime();
-    vector<pair<string, size_t>> counts;
+    vector<pair<string, int>> counts;
     for (auto &el : global_counts) {
         counts.emplace_back(el.first, el.second);
     }
@@ -394,16 +465,20 @@ int main(int argc, char* argv[]) {
     // Print step
     if (rank == 0) {
         cout << "Filename: " << argv[1] << ", total words: " << total_words << endl;
-        for (size_t i = 0; i < counts.size(); ++i) {
-            cout << "[" << i << "] " << counts[i].first << ": " << counts[i].second << endl;
-        }
+        // ISAAC is having issues printing too much output, only print the number of unique words
+        // Error: srun: error: eio_handle_mainloop: Abandoning IO 60 secs after job shutdown initiated
+        cout << "Unique words found: " << counts.size() << endl;
+        // for (size_t i = 0; i < counts.size(); ++i) {
+        //     cout << "[" << i << "] " << counts[i].first << ": " << counts[i].second << endl;
+        // }
     }
 
     end = MPI_Wtime();
     if (rank == 0) {
         // Use cerr to always print in terminal
-        cerr << "OpenMP time: " << (end - start) * 1000 << " ms\n";
-        cerr << "  File read & Map time: " << (start_r - start) * 1000 << " ms\n";
+        cerr << "Hybrid time: " << (end - start) * 1000 << " ms\n";
+        cerr << "  File read & Map time: " << (start_c - start) * 1000 << " ms\n";
+        cerr << "  Communication time: " << (start_r - start_c) * 1000 << " ms\n";
         cerr << "  Reducing time: " << (start_p - start_r) * 1000 << " ms\n";
         cerr << "  Sort & Print time: " << (end - start_p) * 1000 << " ms\n";
     }
