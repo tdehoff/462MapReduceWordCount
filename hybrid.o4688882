@@ -1,0 +1,39 @@
+Testing 4 thread(s), 8 processes
+rank 0 starts reading raw_text_input/1399.txt.utf-8.txt
+read 352661character 
+rank 0 starts reading raw_text_input/2554.txt.utf-8.txt
+read 559162character 
+rank 0 starts reading raw_text_input/39288.txt.utf-8.txt
+rank 1 starts reading a file
+rank 2 starts reading a file
+rank 3 starts reading a file
+rank 5 starts reading a file
+rank 7 starts reading a file
+rank 6 starts reading a file
+rank 4 starts reading a file
+read 620719character 
+rank 0 starts reading raw_text_input/39290-0.txt
+read 641566character 
+rank 0 starts reading raw_text_input/39294.txt.utf-8.txt
+rank 5 starts reading a file
+read 768871character 
+rank 3 starts reading a file
+rank 6 starts reading a file
+rank 7 starts reading a file
+rank 0 starts reading raw_text_input/600.txt.utf-8.txt
+read 815848character 
+rank 0 starts reading raw_text_input/Text1.txt
+rank 1 starts reading a file
+rank 4 starts reading a file
+rank 5 starts reading a file
+read 828907character 
+rank 0 starts reading raw_text_input/Text3.txt
+rank 7 starts reading a file
+read 847101character 
+rank 0 starts reading raw_text_input/Text5.txt
+rank 3 starts reading a file
+read 847117character 
+rank 1 starts reading a file
+rank 2 starts reading a file
+rank 5 starts reading a file
+rank 6 starts reading a file
