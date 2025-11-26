@@ -11,7 +11,7 @@
 
 using namespace std;
 
-vector<string> readers_q;
+unordered_map<string, size_t> readers_map;
 vector<queue<pair<string, size_t>>> reducer_queues;
 unordered_map<string, size_t> global_counts;
 
@@ -26,13 +26,23 @@ vector<omp_lock_t> reducer_locks;
 omp_lock_t global_counts_lock;
 
 void process_word(string &w) {
-    // Remove punctuation at beginning
-    while (!w.empty() && ispunct(w[0])) {
-        w.erase(0, 1);
+    // Remove punctuation and non-ascii chars at beginning
+    while (!w.empty()) {
+        signed char c = w.front();
+        if (c < 0 || ispunct(c)) {
+            w.erase(0, 1);
+            continue;
+        }
+        break;
     }
-    // Remove punctuation at end
-    while (!w.empty() && ispunct(w[w.size() - 1])) {
-        w.pop_back();
+    // Remove punctuation and non-ascii chars at end
+    while (!w.empty()) {
+        signed char c = w.back();
+        if (c < 0 || ispunct(c)) {
+            w.pop_back();
+            continue;
+        }
+        break;
     }
     // Convert all letters to lowercase
     for (size_t i = 0; i < w.length(); ++i) {
@@ -42,7 +52,7 @@ void process_word(string &w) {
     }
 }
 
-void read_file (char* fname) {
+void read_and_map (char* fname) {
     #pragma omp atomic
     readers_avail--;
 
@@ -67,7 +77,9 @@ void read_file (char* fname) {
         }
     }
     omp_set_lock(&readers_lock);
-    readers_q.insert(readers_q.end(), make_move_iterator(words.begin()), make_move_iterator(words.end()));
+    for (string &s : words) {
+        readers_map[s]++;
+    }
     omp_unset_lock(&readers_lock);
 
     #pragma omp atomic
@@ -86,57 +98,6 @@ int hash_str(string s, int R) {
         sum  += c;
     }
     return sum % R;
-}
-
-void mapping_step() {
-    unordered_map<string, size_t> buckets;
-
-    // Grab elemnts from the work q in chunks
-    const int chunk_size = 1024;  // find which chunk size works the best
-    vector<string> working_batch;
-    working_batch.reserve(chunk_size);
-
-    while (true) {
-        working_batch.clear();
-
-        // Lock and grab new chunk of elements if queue is not empty
-        omp_set_lock(&readers_lock);
-        for (size_t i = 0; i < chunk_size && !readers_q.empty(); ++i) {
-            working_batch.push_back(readers_q.back());
-            readers_q.pop_back();
-        }
-        omp_unset_lock(&readers_lock);
-
-        if (!working_batch.empty()) {
-            // Queue not empty -- process new elements
-            for (size_t i = 0; i < working_batch.size(); ++i) {
-                buckets[working_batch[i]]++;
-            }
-        }
-        else {
-            int remaining;
-            // Shared global variable -- must be read atomically
-            #pragma omp atomic read
-            remaining = files_remain;
-
-            if (remaining == 0) {
-                // Queue empty and all files are processed
-                break;
-            }
-            else {
-                // Mappers are ahead of readers
-                #pragma omp taskyield
-            }
-        }
-    }
-
-    // Push thread's results into the reducer queues
-    for (auto el : buckets) {
-        int index = hash_str(el.first, num_reducers);
-        omp_set_lock(&reducer_locks[index]);
-        reducer_queues[index].push(el);
-        omp_unset_lock(&reducer_locks[index]);
-    }
 }
 
 void reduce_step(int id) {
@@ -176,11 +137,10 @@ int main(int argc, char* argv[]) {
     }
 
     int n_threads = omp_get_max_threads();
-    int num_mappers = n_threads;
     num_reducers = n_threads * 2;  // Works best on my laptop -- test on ISAAC
     files_remain = argc - 1;
 
-    num_readers = n_threads / 2;
+    num_readers = n_threads;
     readers_avail = num_readers;
 
     if (rank == 0) {
@@ -209,18 +169,20 @@ int main(int argc, char* argv[]) {
                 MPI_Status stat;
                 int tmp;
                 int flag;
+                int local_avail;
 
                 while (active_ranks > 0) {
                     // Check if any ranks sent a pending request
                     MPI_Iprobe(MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &flag, &stat);
+
                     // If not, generate tasks for master rank theads
-                    if (!flag && readers_avail > 0) {
+                    #pragma omp atomic read
+                    local_avail = readers_avail;
+                    if (!flag && local_avail > 0) {
                         if (f_count < argc) {
                             #pragma omp task
                             {
-                                cerr << "rank " << rank << " starts reading a file " << argv[f_count] << "\n";
-                                read_file(argv[f_count]);
-                                cerr << "rank " << rank << " read " << total_words << "words\n";
+                                read_and_map(argv[f_count]);
                             }
                             f_count++;
                         }
@@ -245,9 +207,12 @@ int main(int argc, char* argv[]) {
                 }
             }
             else {
+                int local_avail;
                 int rec_buff = 0;
                 while (true) {
-                    if (readers_avail > 0) {
+                    #pragma omp atomic read
+                    local_avail = readers_avail;
+                    if (local_avail > 0) {
                         // Send request
                         MPI_Send(&rec_buff, 1, MPI_INT, 0, 1, MPI_COMM_WORLD);
                         // Receive file number or -1 for "work done"
@@ -259,16 +224,15 @@ int main(int argc, char* argv[]) {
 
                         #pragma omp task
                         {
-                            cerr << "rank " << rank << " starts reading a file " << argv[rec_buff] << "\n";
-                            read_file(argv[rec_buff]);
-                            cerr << "rank " << rank << " read " << total_words << "words\n";
+                            read_and_map(argv[rec_buff]);
                         }
                     }
                 }
             }
         }
     }
-
+    end = MPI_Wtime();
+    cerr << "File reading + mapping took " << (end - start) * 1000 << " ms\n";
 
     // #pragma omp parallel
     // {
