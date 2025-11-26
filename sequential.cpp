@@ -28,31 +28,36 @@ void process_word(string &w) {
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <input_file>\n", argv[0]);
+        fprintf(stderr, "usage: %s <input_files>\n", argv[0]);
         return 1;
     }
+
+    vector<pair<string, size_t>> raw_tuples;
+    size_t file_word_count = 0;
 
     double start, end;
     start = omp_get_wtime();
 
+
     // File reading step
-    ifstream fin(argv[1]);
-    if (!fin) {
-        fprintf(stderr, "error: unable to open input file: %s\n", argv[1]);
-        return 1;
-    }
-
-    string word;
-    vector<pair<string, size_t>> raw_tuples;
-    size_t file_word_count = 0;
-
-    while (fin >> word) {
-        process_word(word);
-        // Map step
-        if (!word.empty()) {          // avoid pushing empty strings
-            file_word_count++;
-            raw_tuples.push_back(pair(word, 1));
+    size_t f_count = 1;
+    while (argv[f_count]) {
+        ifstream fin(argv[f_count]);
+        if (!fin) {
+            fprintf(stderr, "error: unable to open input file: %s\n", argv[f_count]);
+            return 1;
         }
+
+        string word;
+        while (fin >> word) {
+            process_word(word);
+            // Map step
+            if (!word.empty()) {          // avoid pushing empty strings
+                file_word_count++;
+                raw_tuples.push_back(pair(word, 1));
+            }
+        }
+        f_count++;
     }
 
     // Shuffle step
