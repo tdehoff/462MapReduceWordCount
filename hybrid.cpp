@@ -443,13 +443,14 @@ int main(int argc, char* argv[]) {
 
     // Print step
     if (rank == 0) {
-        cout << "Filename: " << argv[1] << ", total words: " << global_total_words << endl;
+        ofstream out("hybrid_out.txt");
+        out << "Filename: " << argv[1] << ", total words: " << global_total_words << "\n";
         // ISAAC is having issues printing too much output, only print the number of unique words
         // Error: srun: error: eio_handle_mainloop: Abandoning IO 60 secs after job shutdown initiated
-        cout << "Unique words found: " << counts.size() << endl;
-        // for (size_t i = 0; i < counts.size(); ++i) {
-        //     cout << "[" << i << "] " << counts[i].first << ": " << counts[i].second << endl;
-        // }
+        out << "Unique words found: " << counts.size() << "\n";
+        for (size_t i = 0; i < counts.size(); ++i) {
+            out << "[" << i << "] " << counts[i].first << ": " << counts[i].second << "\n";
+        };
     }
 
     end = MPI_Wtime();
